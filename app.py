@@ -3,6 +3,7 @@ import json
 import math
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
+import httplib2
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
@@ -43,7 +44,7 @@ PARAMETROS = ["PP", "PC", "AT", "RH", "DP", "BP", "RI"]
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def obtener_servicio_drive():
-    """Autentica con la API de Google Drive soportando TOML o JSON en Secrets."""
+    """Autentica con la API de Google Drive manejando reconexiones SSL de forma segura."""
     SCOPES = ["https://www.googleapis.com/auth/drive"]
     
     if "gcp_service_account" in st.secrets:
@@ -57,7 +58,12 @@ def obtener_servicio_drive():
             info_credenciales = json.load(f)
 
     creds = Credentials.from_service_account_info(info_credenciales, scopes=SCOPES)
-    return build("drive", "v3", credentials=creds)
+    
+    # Manejador HTTP resiliente frente a cierres repentinos de socket SSL
+    http_transport = httplib2.Http(timeout=15)
+    authorized_http = creds.authorize(http_transport)
+    
+    return build("drive", "v3", http=authorized_http)
 
 
 def leer_csv_desde_drive(service, folder_id, nombre_archivo):
