@@ -41,7 +41,7 @@ ESTACIONES = {info["nombre"]: id_code for id_code, info in REFERENCIA_PRESION_ES
 PARAMETROS = ["PP", "PC", "AT", "RH", "DP", "BP", "RI"]
 
 # -----------------------------------------------------------------------------
-# CLIENTE GOOGLE DRIVE (CORREGIDO Y RESILIENTE A SSL)
+# CLIENTE GOOGLE DRIVE
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def obtener_servicio_drive():
@@ -69,36 +69,40 @@ def obtener_servicio_drive():
 
 def leer_csv_desde_drive(service, folder_id, nombre_archivo):
     """Busca y descarga un archivo CSV de la carpeta especificada en Drive."""
-    query = f"'{folder_id}' in parents and name = '{nombre_archivo}' and trashed = false"
-    
-    results = service.files().list(
-        q=query, 
-        fields="files(id, name)",
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True
-    ).execute()
-    
-    items = results.get("files", [])
+    try:
+        query = f"'{folder_id}' in parents and name = '{nombre_archivo}' and trashed = false"
+        
+        results = service.files().list(
+            q=query, 
+            fields="files(id, name)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
+        
+        items = results.get("files", [])
 
-    if not items:
+        if not items:
+            return pd.DataFrame(), None
+
+        file_id = items[0]["id"]
+        request = service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+
+        fh.seek(0)
+        df = pd.read_csv(fh)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        return df, file_id
+    except Exception:
+        # En caso de error al leer desde Drive, se retorna un DataFrame vacío para continuar con Scraping
         return pd.DataFrame(), None
-
-    file_id = items[0]["id"]
-    request = service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-
-    fh.seek(0)
-    df = pd.read_csv(fh)
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    return df, file_id
 
 
 def guardar_csv_en_drive(service, folder_id, nombre_archivo, df, file_id=None):
-    """Guarda o actualiza un DataFrame como CSV en Google Drive."""
+    """Intenta guardar o actualizar un CSV en Google Drive tolerando restricciones de cuota."""
     buffer = io.StringIO()
     df.to_csv(buffer, index=False)
     media = MediaIoBaseUpload(
@@ -107,20 +111,25 @@ def guardar_csv_en_drive(service, folder_id, nombre_archivo, df, file_id=None):
         resumable=True,
     )
 
-    if file_id:
-        service.files().update(
-            fileId=file_id, 
-            media_body=media, 
-            supportsAllDrives=True
-        ).execute()
-    else:
-        file_metadata = {"name": nombre_archivo, "parents": [folder_id]}
-        service.files().create(
-            body=file_metadata, 
-            media_body=media, 
-            fields="id", 
-            supportsAllDrives=True
-        ).execute()
+    try:
+        if file_id:
+            service.files().update(
+                fileId=file_id, 
+                media_body=media, 
+                supportsAllDrives=True
+            ).execute()
+        else:
+            file_metadata = {"name": nombre_archivo, "parents": [folder_id]}
+            service.files().create(
+                body=file_metadata, 
+                media_body=media, 
+                fields="id", 
+                supportsAllDrives=True
+            ).execute()
+    except Exception:
+        # La Cuenta de Servicio no tiene cuota propia para subir/modificar archivos.
+        # Capturamos la excepción para evitar que colapse la aplicación en Streamlit.
+        st.warning("⚠️ No se pudo sincronizar el archivo en Google Drive debido a limitaciones de cuota de la Cuenta de Servicio. Los datos calculados se están mostrando en tiempo real.")
 
 
 # -----------------------------------------------------------------------------
@@ -245,7 +254,7 @@ def obtener_datos_completos(estacion_id, folder_id):
     # 4. Aplicar depuración QC e interpolación
     df_unificado = limpiar_y_rellenar_datos(df_unificado)
 
-    # 5. Guardar actualización en Google Drive
+    # 5. Intentar guardar en Google Drive sin detener la app si la cuota falla
     guardar_csv_en_drive(drive_service, folder_id, nombre_archivo, df_unificado, file_id)
 
     return df_unificado.sort_values("timestamp")
@@ -329,6 +338,15 @@ if aplicar_qc:
 else:
     df["PP_Plot"] = df["PP_Calculada"]
     df["PP_Ficticia"] = 0.0
+
+# Botón de descarga local en la barra lateral
+csv_datos = df.to_csv(index=False).encode('utf-8')
+st.sidebar.download_button(
+    label="📥 Descargar CSV Procesado",
+    data=csv_datos,
+    file_name=f"estacion_{estacion_id}_qc.csv",
+    mime="text/csv",
+)
 
 # Tarjetas métricas
 col1, col2, col3, col4 = st.columns(4)
