@@ -4,6 +4,7 @@ import math
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 import httplib2
+import google_auth_httplib2
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
@@ -40,11 +41,11 @@ ESTACIONES = {info["nombre"]: id_code for id_code, info in REFERENCIA_PRESION_ES
 PARAMETROS = ["PP", "PC", "AT", "RH", "DP", "BP", "RI"]
 
 # -----------------------------------------------------------------------------
-# CLIENTE GOOGLE DRIVE
+# CLIENTE GOOGLE DRIVE (CORREGIDO Y RESILIENTE A SSL)
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def obtener_servicio_drive():
-    """Autentica con la API de Google Drive manejando reconexiones SSL de forma segura."""
+    """Autentica con la API de Google Drive usando AuthorizedHttp con timeout SSL."""
     SCOPES = ["https://www.googleapis.com/auth/drive"]
     
     if "gcp_service_account" in st.secrets:
@@ -59,9 +60,9 @@ def obtener_servicio_drive():
 
     creds = Credentials.from_service_account_info(info_credenciales, scopes=SCOPES)
     
-    # Manejador HTTP resiliente frente a cierres repentinos de socket SSL
-    http_transport = httplib2.Http(timeout=15)
-    authorized_http = creds.authorize(http_transport)
+    # Manejo HTTP con timeout para prevenir bloqueos por SSL
+    http_base = httplib2.Http(timeout=15)
+    authorized_http = google_auth_httplib2.AuthorizedHttp(creds, http=http_base)
     
     return build("drive", "v3", http=authorized_http)
 
