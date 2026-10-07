@@ -63,7 +63,14 @@ def obtener_servicio_drive():
 def leer_csv_desde_drive(service, folder_id, nombre_archivo):
     """Busca y descarga un archivo CSV de la carpeta especificada en Drive."""
     query = f"'{folder_id}' in parents and name = '{nombre_archivo}' and trashed = false"
-    results = service.files().list(q=query, fields="files(id, name)").execute()
+    
+    results = service.files().list(
+        q=query, 
+        fields="files(id, name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True
+    ).execute()
+    
     items = results.get("files", [])
 
     if not items:
@@ -94,10 +101,19 @@ def guardar_csv_en_drive(service, folder_id, nombre_archivo, df, file_id=None):
     )
 
     if file_id:
-        service.files().update(fileId=file_id, media_body=media).execute()
+        service.files().update(
+            fileId=file_id, 
+            media_body=media, 
+            supportsAllDrives=True
+        ).execute()
     else:
         file_metadata = {"name": nombre_archivo, "parents": [folder_id]}
-        service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+        service.files().create(
+            body=file_metadata, 
+            media_body=media, 
+            fields="id", 
+            supportsAllDrives=True
+        ).execute()
 
 
 # -----------------------------------------------------------------------------
