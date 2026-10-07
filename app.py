@@ -97,7 +97,6 @@ def leer_csv_desde_drive(service, folder_id, nombre_archivo):
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         return df, file_id
     except Exception:
-        # En caso de error al leer desde Drive, se retorna un DataFrame vacío para continuar con Scraping
         return pd.DataFrame(), None
 
 
@@ -127,8 +126,6 @@ def guardar_csv_en_drive(service, folder_id, nombre_archivo, df, file_id=None):
                 supportsAllDrives=True
             ).execute()
     except Exception:
-        # La Cuenta de Servicio no tiene cuota propia para subir/modificar archivos.
-        # Capturamos la excepción para evitar que colapse la aplicación en Streamlit.
         st.warning("⚠️ No se pudo sincronizar el archivo en Google Drive debido a limitaciones de cuota de la Cuenta de Servicio. Los datos calculados se están mostrando en tiempo real.")
 
 
@@ -307,17 +304,19 @@ if df.empty:
     st.warning("No se encontraron registros para la estación seleccionada.")
     st.stop()
 
-# Filtro interactivo de fechas
+# Filtro interactivo de fechas protegido contra límites
 min_fecha = df["timestamp"].min().date()
 max_fecha = df["timestamp"].max().date()
+fecha_inicio_defecto = max(min_fecha, max_fecha - timedelta(days=7))
+
 fechas_sel = st.sidebar.date_input(
     "Rango de fechas a visualizar",
-    [max_fecha - timedelta(days=7), max_fecha],
+    value=[fecha_inicio_defecto, max_fecha],
     min_value=min_fecha,
     max_value=max_fecha,
 )
 
-if len(fechas_sel) == 2:
+if isinstance(fechas_sel, (tuple, list)) and len(fechas_sel) == 2:
     f_inicio, f_fin = fechas_sel
     df = df[(df["timestamp"].dt.date >= f_inicio) & (df["timestamp"].dt.date <= f_fin)].copy()
 
