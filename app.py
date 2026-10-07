@@ -22,7 +22,7 @@ st.set_page_config(
 
 BASE_URL = "https://www.snet.gob.sv/Geologia/pcbase2/tabla2.php"
 
-# Presión Barométrica Nominal de Referencia (hPa)
+# Presión Barométrica Nominal de Referencia (hPa) por estación en El Salvador
 REFERENCIA_PRESION_ESTACION = {
     "33": {"nombre": "Santa Ana", "bp_ref": 938.0},
     "289": {"nombre": "Ch. del Guayabo", "bp_ref": 995.0},
@@ -43,12 +43,16 @@ PARAMETROS = ["PP", "PC", "AT", "RH", "DP", "BP", "RI"]
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def obtener_servicio_drive():
-    """Autentica con la API de Google Drive usando los Secrets de Streamlit."""
+    """Autentica con la API de Google Drive soportando TOML o JSON en Secrets."""
     SCOPES = ["https://www.googleapis.com/auth/drive"]
+    
     if "gcp_service_account" in st.secrets:
-        info_credenciales = json.loads(st.secrets["gcp_service_account"])
+        cred_sec = st.secrets["gcp_service_account"]
+        if isinstance(cred_sec, str):
+            info_credenciales = json.loads(cred_sec)
+        else:
+            info_credenciales = dict(cred_sec)
     else:
-        # Modo local alternativo
         with open("credentials.json") as f:
             info_credenciales = json.load(f)
 
@@ -97,9 +101,10 @@ def guardar_csv_en_drive(service, folder_id, nombre_archivo, df, file_id=None):
 
 
 # -----------------------------------------------------------------------------
-# SCRAPING Y DEPURACIÓN QC
+# SCRAPING, LIMPIEZA E INTERPOLACIÓN QC
 # -----------------------------------------------------------------------------
 def calcular_punto_rocio_magnus(temp, rh):
+    """Calcula el punto de rocío (°C) mediante la ecuación de Magnus-Tetens."""
     if rh <= 0:
         return temp
     a, b = 17.27, 237.7
@@ -108,12 +113,13 @@ def calcular_punto_rocio_magnus(temp, rh):
 
 
 def limpiar_y_rellenar_datos(df):
+    """Filtra picos/outliers físicos y rellena huecos mediante interpolación temporal."""
     if df.empty:
         return df
 
     df = df.set_index("timestamp").sort_index()
 
-    # Filtros de Rangos Físicos Válidos
+    # 1. Filtros de Rangos Físicos Válidos
     if "AT" in df.columns:
         df.loc[(df["AT"] < 5.0) | (df["AT"] > 48.0), "AT"] = None
     if "RH" in df.columns:
@@ -121,21 +127,21 @@ def limpiar_y_rellenar_datos(df):
     if "BP" in df.columns:
         df.loc[(df["BP"] < 750.0) | (df["BP"] > 1080.0), "BP"] = None
 
-    # Filtro Gradient Check (Spikes)
+    # 2. Filtro Gradient Check (Spikes)
     for col, umbral in [("AT", 6.0), ("BP", 10.0), ("RH", 40.0)]:
         if col in df.columns:
             diff = df[col].diff().abs()
             df.loc[diff > umbral, col] = None
 
-    # Reindexación regular
+    # 3. Reindexación regular de tiempo (cada 10 min)
     full_idx = pd.date_range(start=df.index.min(), end=df.index.max(), freq="10min")
     df = df.reindex(full_idx)
 
-    # Interpolación de variables continuas
+    # 4. Interpolación de variables continuas
     cols_cont = [c for c in ["AT", "RH", "BP"] if c in df.columns]
     df[cols_cont] = df[cols_cont].interpolate(method="time", limit=12).bfill().ffill()
 
-    # Lluvia sin interpolar
+    # 5. Precipitación sin interpolar (faltantes = 0.0)
     cols_lluvia = [c for c in ["PP", "PC"] if c in df.columns]
     df[cols_lluvia] = df[cols_lluvia].fillna(0.0)
 
@@ -190,9 +196,7 @@ def scraping_reciente(estacion_id):
 
 
 def obtener_datos_completos(estacion_id, folder_id):
-    """
-    Sincroniza el historial almacenado en Drive con las últimas lecturas del SNET.
-    """
+    """Sincroniza el historial almacenado en Drive con las últimas lecturas del SNET."""
     drive_service = obtener_servicio_drive()
     nombre_archivo = f"estacion_{estacion_id}_historico.csv"
 
@@ -218,7 +222,7 @@ def obtener_datos_completos(estacion_id, folder_id):
     # 4. Aplicar depuración QC e interpolación
     df_unificado = limpiar_y_rellenar_datos(df_unificado)
 
-    # 5. Guardar la versión actualizada de nuevo en Google Drive
+    # 5. Guardar actualización en Google Drive
     guardar_csv_en_drive(drive_service, folder_id, nombre_archivo, df_unificado, file_id)
 
     return df_unificado.sort_values("timestamp")
@@ -252,13 +256,12 @@ def evaluar_control_calidad_lluvia(row, estacion_id):
 st.title("🌧️ Portal de Control de Calidad Meteorológico")
 st.caption("Producto de Uso Interno CCA - DOA - MARN | Módulo QC Continuum")
 
-# Sidebar
+# Panel lateral
 st.sidebar.header("Parámetros de Entrada")
 estacion_nombre = st.sidebar.selectbox("Estación Meteorológica", list(ESTACIONES.keys()))
 estacion_id = ESTACIONES[estacion_nombre]
 aplicar_qc = st.sidebar.checkbox("Activar Algoritmo QC (Filtrar Lluvia Ficticia)", value=True)
 
-# Google Drive Folder ID desde Secrets
 FOLDER_ID = st.secrets.get("GOOGLE_DRIVE_FOLDER_ID", "")
 
 if not FOLDER_ID:
@@ -272,10 +275,15 @@ if df.empty:
     st.warning("No se encontraron registros para la estación seleccionada.")
     st.stop()
 
-# Selección de Rango de Fechas
+# Filtro interactivo de fechas
 min_fecha = df["timestamp"].min().date()
 max_fecha = df["timestamp"].max().date()
-fechas_sel = st.sidebar.date_input("Rango de fechas a visualizar", [max_fecha - timedelta(days=7), max_fecha], min_value=min_fecha, max_value=max_fecha)
+fechas_sel = st.sidebar.date_input(
+    "Rango de fechas a visualizar",
+    [max_fecha - timedelta(days=7), max_fecha],
+    min_value=min_fecha,
+    max_value=max_fecha,
+)
 
 if len(fechas_sel) == 2:
     f_inicio, f_fin = fechas_sel
@@ -299,22 +307,25 @@ else:
     df["PP_Plot"] = df["PP_Calculada"]
     df["PP_Ficticia"] = 0.0
 
-# Tarjetas Métricas
+# Tarjetas métricas
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Precipitación Validada QC", f"{df['PP_Plot'].sum():.1f} mm")
 col2.metric("Lluvia Ficticia Descartada", f"{df['PP_Ficticia'].sum():.1f} mm")
 col3.metric("Rango Térmico", f"{df['AT'].min():.1f}°C / {df['AT'].max():.1f}°C")
 col4.metric("Humedad Promedio", f"{df['RH'].mean():.0f}%")
 
-# Gráficos Apilados Plotly
+# Gráficos Apilados
 fig = make_subplots(
-    rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+    rows=4,
+    cols=1,
+    shared_xaxes=True,
+    vertical_spacing=0.03,
     subplot_titles=(
         "Precipitación Validada y Ruido de Sensor (mm / 10 min)",
         "Humedad Relativa (%)",
         "Presión Barométrica (hPa)",
-        "Temperatura del Aire (°C) y Punto de Rocío (°C)"
-    )
+        "Temperatura del Aire (°C) y Punto de Rocío (°C)",
+    ),
 )
 
 fig.add_trace(go.Bar(x=df["timestamp"], y=df["PP_Plot"], marker_color="#38BDF8", name="Lluvia Real"), row=1, col=1)
