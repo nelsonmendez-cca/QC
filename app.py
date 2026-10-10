@@ -1,7 +1,7 @@
 import io
 import math
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from bs4 import BeautifulSoup
 import pandas as pd
 import plotly.graph_objects as go
@@ -139,7 +139,7 @@ def obtener_serie_tiempo(estacion_id, parametro, fecha_str):
 def scraping_reciente(estacion_id):
     hoy = datetime.now()
     registros = []
-    for d in range(6, -1, -1):
+    for d in range(7, -1, -1):
         fecha_dt = hoy - timedelta(days=d)
         str_fecha = fecha_dt.strftime("%Y-%m-%d")
         for param in PARAMETROS:
@@ -224,43 +224,50 @@ if df_full.empty:
     st.stop()
 
 # -----------------------------------------------------------------------------
-# SELECCIÓN Y NAVEGACIÓN DÍA POR DÍA
+# LÓGICA DE DÍA METEOROLÓGICO (7:00 AM - 7:00 AM)
 # -----------------------------------------------------------------------------
 st.sidebar.markdown("---")
-st.sidebar.subheader("📅 Análisis Día por Día")
+st.sidebar.subheader("📅 Día Meteorológico (7 AM - 7 AM)")
 
-# Obtener lista de fechas únicas disponibles (ordenadas descendentemente: el más reciente primero)
-fechas_disponibles = sorted(df_full["timestamp"].dt.date.unique(), reverse=True)
+# Si la hora es menor a las 7:00 AM, la observación pertenece al día meteorológico anterior
+df_full["fecha_meteo"] = df_full["timestamp"].apply(
+    lambda ts: (ts.date() - timedelta(days=1)) if ts.time() < time(7, 0) else ts.date()
+)
+
+fechas_meteo_disponibles = sorted(df_full["fecha_meteo"].unique(), reverse=True)
 
 if "dia_idx" not in st.session_state:
-    st.session_state.dia_idx = 0  # Por defecto el día más reciente (índice 0)
+    st.session_state.dia_idx = 0
 
-# Botones de navegación diaria rápida
+# Botones de navegación rápida entre días meteorológicos
 col_nav1, col_nav2 = st.sidebar.columns(2)
 if col_nav1.button("⬅️ Día Anterior"):
-    if st.session_state.dia_idx < len(fechas_disponibles) - 1:
+    if st.session_state.dia_idx < len(fechas_meteo_disponibles) - 1:
         st.session_state.dia_idx += 1
 
 if col_nav2.button("Día Siguiente ➡️"):
     if st.session_state.dia_idx > 0:
         st.session_state.dia_idx -= 1
 
-# Selector directo por calendario/lista
-dia_seleccionado = st.sidebar.selectbox(
-    "Seleccionar fecha específica:",
-    options=fechas_disponibles,
+dia_meteo_sel = st.sidebar.selectbox(
+    "Seleccionar Día Meteorológico (Fin a las 7 AM):",
+    options=fechas_meteo_disponibles,
     index=st.session_state.dia_idx,
-    key="select_dia"
+    format_func=lambda d: f"{d.strftime('%d/%m/%Y')} (7 AM) ➔ {(d + timedelta(days=1)).strftime('%d/%m/%Y')} (7 AM)",
+    key="select_dia_meteo"
 )
 
-# Actualizar el índice al cambiar en el selectbox
-st.session_state.dia_idx = fechas_disponibles.index(dia_seleccionado)
+st.session_state.dia_idx = fechas_meteo_disponibles.index(dia_meteo_sel)
 
-# Filtrar el DataFrame al día seleccionado únicamente
-df = df_full[df_full["timestamp"].dt.date == dia_seleccionado].copy()
+# Definir ventana exacta de 24 horas: desde las 7:00 AM del día A hasta las 7:00 AM del día A+1
+ts_inicio = datetime.combine(dia_meteo_sel, time(7, 0))
+ts_fin = datetime.combine(dia_meteo_sel + timedelta(days=1), time(7, 0))
+
+# Filtrar DataFrame para la ventana seleccionada
+df = df_full[(df_full["timestamp"] >= ts_inicio) & (df_full["timestamp"] <= ts_fin)].copy()
 
 # -----------------------------------------------------------------------------
-# PROCESAMIENTO QC DEL DÍA
+# PROCESAMIENTO QC
 # -----------------------------------------------------------------------------
 if "PC" in df.columns:
     df["PP_Calculada"] = df["PC"].diff().fillna(0).apply(lambda x: x if 0 < x < 30 else 0.0)
@@ -282,13 +289,14 @@ else:
 # Botón de descarga local
 csv_datos = df.to_csv(index=False).encode('utf-8')
 st.sidebar.download_button(
-    label="📥 Descargar CSV del Día",
+    label="📥 Descargar CSV del Día Meteo",
     data=csv_datos,
-    file_name=f"estacion_{estacion_id}_{dia_seleccionado}_qc.csv",
+    file_name=f"estacion_{estacion_id}_{dia_meteo_sel}_7am_qc.csv",
     mime="text/csv",
 )
 
-st.subheader(f"📊 Análisis del {dia_seleccionado.strftime('%d/%m/%Y')} - Estación {estacion_nombre}")
+st.subheader(f"📊 Día Meteorológico: {ts_inicio.strftime('%d/%m/%Y %I:%M %p')} a {ts_fin.strftime('%d/%m/%Y %I:%M %p')}")
+st.caption(f"Estación: **{estacion_nombre}** | Ventana de 24 horas acumuladas")
 
 # Tarjetas métricas
 col1, col2, col3, col4 = st.columns(4)
