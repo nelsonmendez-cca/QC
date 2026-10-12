@@ -208,7 +208,7 @@ def evaluar_control_calidad_lluvia(row, estacion_id):
 # INTERFAZ STREAMLIT
 # -----------------------------------------------------------------------------
 st.title("🌧️ Portal de Control de Calidad Meteorológico")
-st.caption("Producto de Uso Interno CCA - DOA - MARN | Módulo QC Continuum")
+st.caption("Producto de Uso Interno CCA - DOA - MARN | by: N.Cisneros")
 
 # Panel lateral
 st.sidebar.header("Parámetros de Entrada")
