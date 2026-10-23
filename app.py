@@ -1,49 +1,198 @@
 import io
 import math
-import numpy as np
+import os
+from datetime import datetime, timedelta, time
+from bs4 import BeautifulSoup
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import requests
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
-import gdown
-from pathlib import Path
-import tempfile
-import re
 
+# Configuración de página Streamlit
 st.set_page_config(
-    page_title="3DPaws | Estación meteorológica El Salvador",
-    page_icon="🌦️",
+    page_title="Sistema QC Meteorológico | CCA-DOA-MARN",
+    page_icon="🌧️",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-MISSING = -999.99
+BASE_URL = "https://www.snet.gob.sv/Geologia/pcbase2/tabla2.php"
+DATA_DIR = "data"
 
-# ---------------------------------------------------------------------
-# Funciones auxiliares de física/QC
-# ---------------------------------------------------------------------
+# Crear directorio local de datos si no existe
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Presión Barométrica Nominal de Referencia (hPa) por estación en El Salvador
+REFERENCIA_PRESION_ESTACION = {
+    "33": {"nombre": "Santa Ana", "bp_ref": 938.0},
+    "289": {"nombre": "Ch. del Guayabo", "bp_ref": 995.0},
+    "283": {"nombre": "Ahuachapán", "bp_ref": 930.0},
+    "284": {"nombre": "Hachadura Met", "bp_ref": 1013.25},
+    "31": {"nombre": "La Unión", "bp_ref": 1013.25},
+    "279": {"nombre": "Jiquilisco", "bp_ref": 1013.25},
+    "120": {"nombre": "Hda Melara", "bp_ref": 1013.25},
+    "36": {"nombre": "PROCAFE", "bp_ref": 940.0},
+    "280": {"nombre": "SANTA ROSA", "bp_ref": 940.0},
+}
+
+ESTACIONES = {info["nombre"]: id_code for id_code, info in REFERENCIA_PRESION_ESTACION.items()}
+PARAMETROS = ["PP", "PC", "AT", "RH", "DP", "BP", "RI"]
+
+# -----------------------------------------------------------------------------
+# ALMACENAMIENTO EN REPOSITORIO (GIT / LOCAL)
+# -----------------------------------------------------------------------------
+def leer_csv_local(estacion_id):
+    """Lee el histórico almacenado localmente en la carpeta data/."""
+    path = os.path.join(DATA_DIR, f"estacion_{estacion_id}_historico.csv")
+    if os.path.exists(path):
+        try:
+            df = pd.read_csv(path)
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            return df
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def guardar_csv_local(estacion_id, df):
+    """Guarda el archivo unificado en la carpeta data/."""
+    path = os.path.join(DATA_DIR, f"estacion_{estacion_id}_historico.csv")
+    try:
+        df.to_csv(path, index=False)
+    except Exception as e:
+        st.warning(f"No se pudo guardar el archivo localmente: {e}")
+
+
+# -----------------------------------------------------------------------------
+# SCRAPING, LIMPIEZA E INTERPOLACIÓN QC
+# -----------------------------------------------------------------------------
 def calcular_punto_rocio_magnus(temp, rh):
     """Calcula el punto de rocío (°C) mediante la ecuación de Magnus-Tetens."""
-    if pd.isna(temp) or pd.isna(rh) or rh <= 0:
-        return np.nan
+    if rh <= 0:
+        return temp
     a, b = 17.27, 237.7
     alpha = ((a * temp) / (b + temp)) + math.log(rh / 100.0)
     return (b * alpha) / (a - alpha)
 
-def evaluar_control_calidad_lluvia(row):
-    """Valida si un evento de precipitación es real o ruido mecánico/ficticio."""
+
+def limpiar_y_rellenar_datos(df):
+    """Filtra picos/outliers físicos y rellena huecos mediante interpolación temporal."""
+    if df.empty:
+        return df
+
+    df = df.set_index("timestamp").sort_index()
+
+    # 1. Filtros de Rangos Físicos Válidos
+    if "AT" in df.columns:
+        df.loc[(df["AT"] < 5.0) | (df["AT"] > 48.0), "AT"] = None
+    if "RH" in df.columns:
+        df.loc[(df["RH"] < 0.0) | (df["RH"] > 100.0), "RH"] = None
+    if "BP" in df.columns:
+        df.loc[(df["BP"] < 750.0) | (df["BP"] > 1080.0), "BP"] = None
+
+    # 2. Filtro Gradient Check (Spikes)
+    for col, umbral in [("AT", 6.0), ("BP", 10.0), ("RH", 40.0)]:
+        if col in df.columns:
+            diff = df[col].diff().abs()
+            df.loc[diff > umbral, col] = None
+
+    # 3. Reindexación regular de tiempo (cada 10 min)
+    full_idx = pd.date_range(start=df.index.min(), end=df.index.max(), freq="10min")
+    df = df.reindex(full_idx)
+
+    # 4. Interpolación de variables continuas
+    cols_cont = [c for c in ["AT", "RH", "BP"] if c in df.columns]
+    df[cols_cont] = df[cols_cont].interpolate(method="time", limit=12).bfill().ffill()
+
+    # 5. Precipitación sin interpolar (faltantes = 0.0)
+    cols_lluvia = [c for c in ["PP", "PC"] if c in df.columns]
+    df[cols_lluvia] = df[cols_lluvia].fillna(0.0)
+
+    df = df.reset_index().rename(columns={"index": "timestamp"})
+    df["fecha"] = df["timestamp"].dt.strftime("%Y-%m-%d")
+    return df
+
+
+def obtener_serie_tiempo(estacion_id, parametro, fecha_str):
+    params = {"estacionid": estacion_id, "parametroid": parametro, "fecha": fecha_str}
+    try:
+        r = requests.get(BASE_URL, params=params, timeout=8)
+        soup = BeautifulSoup(r.text, "html.parser")
+    except Exception:
+        return {}
+
+    datos = {}
+    for fila in soup.find_all("tr"):
+        cols = fila.find_all("td")
+        if len(cols) >= 3:
+            hora = cols[1].get_text(strip=True)
+            valor_txt = cols[2].get_text(strip=True).replace(",", ".")
+            if ":" in hora:
+                try:
+                    datos[hora] = float(valor_txt)
+                except ValueError:
+                    pass
+    return datos
+
+
+def scraping_reciente(estacion_id):
+    hoy = datetime.now()
+    registros = []
+    for d in range(7, -1, -1):
+        fecha_dt = hoy - timedelta(days=d)
+        str_fecha = fecha_dt.strftime("%Y-%m-%d")
+        for param in PARAMETROS:
+            datos = obtener_serie_tiempo(estacion_id, param, str_fecha)
+            for hora, val in datos.items():
+                try:
+                    ts = datetime.strptime(f"{str_fecha} {hora}", "%Y-%m-%d %H:%M")
+                except ValueError:
+                    continue
+                registros.append({"timestamp": ts, "fecha": str_fecha, "param": param, "valor": val})
+
+    if not registros:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(registros)
+    df = df.pivot_table(index=["timestamp", "fecha"], columns="param", values="valor", aggfunc="first").reset_index()
+    return df
+
+
+def obtener_datos_completos(estacion_id):
+    """Sincroniza el historial almacenado localmente con las últimas lecturas del SNET."""
+    df_historico = leer_csv_local(estacion_id)
+    df_reciente = scraping_reciente(estacion_id)
+
+    if not df_reciente.empty:
+        if not df_historico.empty:
+            df_unificado = pd.concat([df_historico, df_reciente], ignore_index=True)
+            df_unificado = df_unificado.drop_duplicates(subset=["timestamp"], keep="last")
+        else:
+            df_unificado = df_reciente
+    else:
+        df_unificado = df_historico
+
+    if df_unificado.empty:
+        return pd.DataFrame()
+
+    df_unificado = limpiar_y_rellenar_datos(df_unificado)
+    guardar_csv_local(estacion_id, df_unificado)
+
+    return df_unificado.sort_values("timestamp")
+
+
+def evaluar_control_calidad_lluvia(row, estacion_id):
     pp = row.get("PP_Calculada", 0.0)
-    if pd.isna(pp) or pp <= 0:
+    if pp <= 0:
         return False
 
-    rh = row.get("hum_hum", np.nan)
-    temp = row.get("mcp9808", np.nan)
-    dp = row.get("punto_rocio", np.nan)
-    bp = row.get("bmp_pres", 1013.25)
-    bp_ref = 1013.25
+    rh, temp, dp, bp = row.get("RH", 0.0), row.get("AT", 0.0), row.get("DP", 0.0), row.get("BP", 1013.25)
+    info = REFERENCIA_PRESION_ESTACION.get(estacion_id, {"bp_ref": 1013.25})
+    bp_ref = info["bp_ref"]
 
-    if pd.isna(rh) or pd.isna(temp) or pd.isna(dp):
-        return True  # Si faltan datos de respaldo, no se descarta por defecto
+    if bp > 980.0 and bp_ref < 980.0:
+        bp_ref = 1013.25
 
     depresion_rocio = temp - dp
 
@@ -54,522 +203,130 @@ def evaluar_control_calidad_lluvia(row):
 
     return False
 
-# ---------------------------------------------------------------------
-# Carga y limpieza
-# ---------------------------------------------------------------------
-@st.cache_data
-def cargar_dat(file_bytes):
-    df = pd.read_csv(
-        io.BytesIO(file_bytes),
-        sep=r"\s+",
-        engine="python",
-    )
 
-    df.columns = (
-        df.columns.astype(str)
-        .str.replace("\ufeff", "", regex=False)
-        .str.strip()
-        .str.lower()
-    )
+# -----------------------------------------------------------------------------
+# INTERFAZ STREAMLIT
+# -----------------------------------------------------------------------------
+st.title("🌧️ Portal de Control de Calidad Meteorológico")
+st.caption("Producto de Uso Interno CCA - DOA - MARN | by: N.Cisneros")
 
-    columnas_fecha = {"year", "mon", "day", "hour", "min"}
-    for col in df.columns:
-        if col not in columnas_fecha:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+# Panel lateral
+st.sidebar.header("Parámetros de Entrada")
+estacion_nombre = st.sidebar.selectbox("Estación Meteorológica", list(ESTACIONES.keys()))
+estacion_id = ESTACIONES[estacion_nombre]
+aplicar_qc = st.sidebar.checkbox("Activar Algoritmo QC (Filtrar Lluvia Ficticia)", value=True)
 
-    columnas_obligatorias = {"year", "mon", "day", "hour", "min"}
-    faltan_fecha = columnas_obligatorias - set(df.columns)
-    if faltan_fecha:
-        raise ValueError(
-            "El archivo no tiene el formato 3DPaws esperado. "
-            f"Faltan columnas: {', '.join(sorted(faltan_fecha))}. "
-            "Solo deben procesarse archivos recordings_YYYY_MM_DD.dat."
-        )
+with st.spinner("Cargando datos y consultando las últimas lecturas del SNET..."):
+    df_full = obtener_datos_completos(estacion_id)
 
-    # Fecha/hora ajustada a El Salvador (UTC-6)
-    df["fecha_hora"] = (
-        pd.to_datetime(
-            dict(year=df["year"], month=df["mon"], day=df["day"], hour=df["hour"], minute=df["min"]),
-            errors="coerce",
-        ) - pd.Timedelta(hours=6)
-    )
-
-    # Limpieza de nulos (-999.99 o similares)
-    for col in df.columns:
-        if pd.api.types.is_numeric_dtype(df[col]):
-            df.loc[df[col] <= -999, col] = np.nan
-
-    df = df.sort_values("fecha_hora").reset_index(drop=True)
-
-    # Cálculo de Punto de Rocío
-    if "mcp9808" in df.columns and "hum_hum" in df.columns:
-        df["punto_rocio"] = df.apply(
-            lambda r: calcular_punto_rocio_magnus(r["mcp9808"], r["hum_hum"]), axis=1
-        )
-
-    return df
-
-@st.cache_data
-def convert_df_to_csv(df):
-    return df.to_csv(index=False).encode("utf-8")
-
-def resumen_variable(df, col):
-    s = pd.to_numeric(df[col], errors="coerce").dropna()
-    if s.empty:
-        return None
-    return {
-        "n": len(s),
-        "min": s.min(),
-        "max": s.max(),
-        "media": s.mean(),
-        "mediana": s.median(),
-        "std": s.std(),
-        "p05": s.quantile(.05),
-        "p95": s.quantile(.95),
-    }
-
-def rango_texto(df):
-    t = df["fecha_hora"].dropna()
-    if t.empty:
-        return "Sin fechas válidas"
-    return f"{t.min():%d/%m/%Y %H:%M} → {t.max():%d/%m/%Y %H:%M}"
-
-# ---------------------------------------------------------------------
-# Funciones de Gráficos (Eje X en formato 12 Horas, sin marcas de fecha)
-# ---------------------------------------------------------------------
-def dar_formato_eje_hora(ax):
-    """Aplica formato de 12 horas al eje X eliminando la fecha."""
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%I:%M %p"))
-    ax.grid(True, alpha=.25)
-
-def grafico_temperatura(df):
-    fig, ax = plt.subplots(figsize=(12, 4.5))
-
-    if "mcp9808" in df.columns:
-        serie = pd.to_numeric(df["mcp9808"], errors="coerce")
-        mask = df["fecha_hora"].notna() & serie.notna()
-        if mask.any():
-            ax.plot(
-                df.loc[mask, "fecha_hora"],
-                serie.loc[mask],
-                linewidth=1.3,
-                color="tab:red",
-                label="Temperatura del Aire",
-            )
-            ax.legend(loc="upper left")
-        else:
-            ax.text(0.5, 0.5, "Sin registros válidos de temperatura", transform=ax.transAxes, ha="center")
-    else:
-        ax.text(0.5, 0.5, "No se encontró el registro de temperatura", transform=ax.transAxes, ha="center")
-
-    ax.set_title("Temperatura del Aire (°C)")
-    ax.set_xlabel("Hora")
-    ax.set_ylabel("Temperatura (°C)")
-    dar_formato_eje_hora(ax)
-    fig.autofmt_xdate()
-    fig.tight_layout()
-    return fig
-
-def grafico_linea(df, columnas, etiquetas, titulo, ylabel):
-    fig, ax = plt.subplots(figsize=(12, 4.5))
-    for col, lbl in zip(columnas, etiquetas):
-        if col in df.columns:
-            ax.plot(df["fecha_hora"], df[col], linewidth=1.3, label=lbl)
-    ax.set_title(titulo)
-    ax.set_xlabel("Hora")
-    ax.set_ylabel(ylabel)
-    ax.legend()
-    dar_formato_eje_hora(ax)
-    fig.autofmt_xdate()
-    fig.tight_layout()
-    return fig
-
-def dibujar_pluviometro(valor_mm, capacidad=100):
-    fig, ax = plt.subplots(figsize=(4, 6))
-    v = max(0, float(valor_mm))
-    n = min(v / capacidad, 1)
-    x0, x1, y0, y1 = .3, .7, .08, .88
-
-    ax.add_patch(plt.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, linewidth=2))
-    ax.add_patch(plt.Rectangle((x0, y0), x1 - x0, (y1 - y0) * n, color="tab:blue", alpha=.55))
-    ax.plot([x0 - .04, x1 + .04], [y1, y1], linewidth=3, color="black")
-
-    for mm in range(0, capacidad + 1, 10):
-        y = y0 + (y1 - y0) * mm / capacidad
-        ln = .07 if mm % 20 == 0 else .045
-        ax.plot([x1, x1 + ln], [y, y], color="black")
-        if mm % 20 == 0:
-            ax.text(x1 + ln + .025, y, str(mm), va="center", fontsize=9)
-
-    ax.text(.5, .96, "PLUVIÓMETRO", ha="center", fontsize=12, fontweight="bold")
-    ax.text(.5, .02, f"Precipitación: {v:.1f} mm", ha="center", fontsize=11, fontweight="bold")
-    ax.set_xlim(.18, .95)
-    ax.set_ylim(0, 1.03)
-    ax.axis("off")
-    fig.tight_layout()
-    return fig
-
-def grafico_viento(df):
-    if "wind_dir" not in df.columns or "wind_speed" not in df.columns:
-        return None, None
-
-    w = pd.DataFrame({
-        "direccion": pd.to_numeric(df["wind_dir"], errors="coerce"),
-        "velocidad": pd.to_numeric(df["wind_speed"], errors="coerce"),
-        "fecha": df["fecha_hora"],
-    })
-
-    w = w[w["direccion"].between(0, 360, inclusive="both")]
-    w = w[np.isfinite(w["direccion"])]
-    w_rosa = w[w["velocidad"] > 0].copy()
-
-    if w_rosa.empty:
-        return None, None
-
-    sectores = np.arange(0, 360, 22.5)
-    nombres = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSO", "SO", "OSO", "O", "ONO", "NO", "NNO"]
-
-    idx = ((w_rosa["direccion"] + 11.25) // 22.5).astype(int) % 16
-    frecuencias = idx.value_counts().reindex(range(16), fill_value=0).sort_index()
-    porcentajes = frecuencias / frecuencias.sum() * 100
-
-    idx_predominante = int(porcentajes.values.argmax())
-    direccion_predominante = float(sectores[idx_predominante])
-    nombre_predominante = nombres[idx_predominante]
-    porcentaje_predominante = float(porcentajes.iloc[idx_predominante])
-
-    w_ultimo = w.dropna(subset=["direccion", "fecha"]).sort_values("fecha")
-    if w_ultimo.empty:
-        ultimo_dir, ultima_fecha, ultimo_nombre = None, None, None
-    else:
-        ultimo_dir = float(w_ultimo.iloc[-1]["direccion"]) % 360
-        ultima_fecha = w_ultimo.iloc[-1]["fecha"]
-        idx_ultimo = int(((ultimo_dir + 11.25) // 22.5)) % 16
-        ultimo_nombre = nombres[idx_ultimo]
-
-    theta = np.deg2rad(sectores)
-    width = np.deg2rad(22.5)
-
-    fig = plt.figure(figsize=(6.8, 6.4))
-    ax = fig.add_subplot(111, polar=True)
-
-    ax.bar(
-        theta,
-        porcentajes.values,
-        width=width * 0.92,
-        align="center",
-        alpha=.75,
-        color="tab:blue",
-        edgecolor="black",
-        linewidth=.5,
-    )
-
-    ax.set_theta_zero_location("N")
-    ax.set_theta_direction(-1)
-    ax.set_xticks(theta)
-    ax.set_xticklabels(nombres)
-    ax.set_ylabel("Frecuencia (%)")
-    ax.set_title("Rosa de Viento — Frecuencia (%)", pad=22)
-
-    if ultimo_dir is not None:
-        ang = np.deg2rad(ultimo_dir)
-        r_flecha = max(float(porcentajes.max()) * 0.92, 10.0)
-        ax.annotate(
-            "",
-            xy=(ang, r_flecha),
-            xytext=(ang, 0),
-            arrowprops=dict(arrowstyle="-|>", color="black", lw=3.0, mutation_scale=18),
-            zorder=10,
-        )
-        ax.scatter([ang], [r_flecha], s=55, color="black", zorder=11)
-        ax.text(
-            0.5, -0.10,
-            f"Último dato: {ultimo_dir:.1f}° ({ultimo_nombre})",
-            transform=ax.transAxes, ha="center", va="center",
-            fontsize=10, fontweight="bold",
-        )
-
-    ax.text(
-        0.5, -0.16,
-        f"Predominante: {nombre_predominante} ({direccion_predominante:.1f}°) — {porcentaje_predominante:.1f}%",
-        transform=ax.transAxes, ha="center", va="center", fontsize=10,
-    )
-
-    fig.tight_layout()
-
-    info = {
-        "n_mediciones": len(w_rosa),
-        "predominante": nombre_predominante,
-        "predominante_grados": direccion_predominante,
-        "predominante_porcentaje": porcentaje_predominante,
-        "ultimo_grados": ultimo_dir,
-        "ultimo_sector": ultimo_nombre,
-        "ultima_fecha": ultima_fecha,
-    }
-    return fig, info
-
-# ---------------------------------------------------------------------
-# Interfaz principal
-# ---------------------------------------------------------------------
-st.title("🌦️ Estación Meteorológica — El Salvador")
-st.caption("Visualización y Control de Calidad Meteorológico (Zona Horaria El Salvador UTC-6)")
-
-AUTO_REFRESH_SECONDS = 300
-st_autorefresh(interval=AUTO_REFRESH_SECONDS * 1000, key="3dpaws_auto_refresh")
-
-DRIVE_FOLDER_URL = "https://drive.google.com/drive/folders/1ECyuzx0Ec_6g7eoJvBkvHXWH89kgeLpJ"
-DRIVE_CACHE_TTL = 240
-
-@st.cache_data(ttl=DRIVE_CACHE_TTL, show_spinner=False)
-def listar_archivos_drive():
-    cache_dir = Path(tempfile.gettempdir()) / "3dpaws_drive"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    archivos = gdown.download_folder(
-        url=DRIVE_FOLDER_URL,
-        output=str(cache_dir),
-        quiet=True,
-        use_cookies=False,
-        skip_download=True,
-    )
-
-    patron = re.compile(r"^recordings_(20\d{2})_(\d{2})_(\d{2})\.dat$", re.IGNORECASE)
-    encontrados = []
-    for item in archivos:
-        nombre = Path(getattr(item, "path", str(item))).name
-        m = patron.match(nombre)
-        if not m:
-            continue
-
-        try:
-            fecha = pd.Timestamp(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        except ValueError:
-            continue
-
-        encontrados.append({
-            "nombre": nombre,
-            "id": getattr(item, "id", None),
-            "fecha": fecha,
-        })
-    return encontrados
-
-def descargar_archivo_drive(file_id, nombre):
-    cache_dir = Path(tempfile.gettempdir()) / "3dpaws_drive"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    destino = cache_dir / Path(nombre).name
-
-    if destino.exists():
-        try:
-            destino.unlink()
-        except OSError:
-            pass
-
-    if not file_id:
-        raise RuntimeError(f"Google Drive no devolvió el ID del archivo '{nombre}'.")
-
-    gdown.download(id=file_id, output=str(destino), quiet=True, use_cookies=False)
-
-    if not destino.exists():
-        raise FileNotFoundError(f"No se pudo descargar: {nombre}")
-
-    return destino.read_bytes()
-
-try:
-    archivos_drive = listar_archivos_drive()
-except Exception as e:
-    st.error(f"No se pudo leer la carpeta pública de Google Drive: {e}")
+if df_full.empty:
+    st.warning("No se encontraron registros para la estación seleccionada.")
     st.stop()
 
-if not archivos_drive:
-    st.warning("No se encontraron archivos en Google Drive.")
-    st.stop()
+# -----------------------------------------------------------------------------
+# LÓGICA DE DÍA METEOROLÓGICO (7:00 AM - 7:00 AM)
+# -----------------------------------------------------------------------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("📅 Día Meteorológico (7 AM - 7 AM)")
 
-archivos_drive = sorted(archivos_drive, key=lambda x: (x["fecha"], x["nombre"]), reverse=True)
-nombres = [x["nombre"] for x in archivos_drive]
+# Si la hora es menor a las 7:00 AM, la observación pertenece al día meteorológico anterior
+df_full["fecha_meteo"] = df_full["timestamp"].apply(
+    lambda ts: (ts.date() - timedelta(days=1)) if ts.time() < time(7, 0) else ts.date()
+)
 
-st.subheader("📂 Selección de Registro")
-seleccion = st.selectbox("Archivo de la estación", nombres, index=0)
+fechas_meteo_disponibles = sorted(df_full["fecha_meteo"].unique(), reverse=True)
 
-archivo_info = next(x for x in archivos_drive if x["nombre"] == seleccion)
+if "dia_idx" not in st.session_state:
+    st.session_state.dia_idx = 0
 
-with st.spinner(f"Descargando {seleccion}..."):
-    datos_archivo = descargar_archivo_drive(archivo_info["id"], archivo_info["nombre"])
+# Botones de navegación rápida entre días meteorológicos
+col_nav1, col_nav2 = st.sidebar.columns(2)
+if col_nav1.button("⬅️ Día Anterior"):
+    if st.session_state.dia_idx < len(fechas_meteo_disponibles) - 1:
+        st.session_state.dia_idx += 1
 
-df = cargar_dat(datos_archivo)
+if col_nav2.button("Día Siguiente ➡️"):
+    if st.session_state.dia_idx > 0:
+        st.session_state.dia_idx -= 1
 
-# Resumen general
-st.subheader("Resumen del registro")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Observaciones", f"{len(df):,}")
-c2.metric("Inicio", df["fecha_hora"].min().strftime("%d/%m %I:%M %p"))
-c3.metric("Fin", df["fecha_hora"].max().strftime("%d/%m %I:%M %p"))
-duracion = df["fecha_hora"].max() - df["fecha_hora"].min()
-c4.metric("Duración", str(duracion).split(".")[0])
+dia_meteo_sel = st.sidebar.selectbox(
+    "Seleccionar Día Meteorológico (Fin a las 7 AM):",
+    options=fechas_meteo_disponibles,
+    index=st.session_state.dia_idx,
+    format_func=lambda d: f"{d.strftime('%d/%m/%Y')} (7 AM) ➔ {(d + timedelta(days=1)).strftime('%d/%m/%Y')} (7 AM)",
+    key="select_dia_meteo"
+)
 
-st.write(f"**Periodo:** {rango_texto(df)}")
+st.session_state.dia_idx = fechas_meteo_disponibles.index(dia_meteo_sel)
 
-# Control de calidad de variables
-with st.expander("🔍 Control de Calidad — Completitud de Variables"):
-    numeric_cols = [
-        c for c in df.columns
-        if pd.api.types.is_numeric_dtype(df[c])
-        and c not in ["year", "mon", "day", "hour", "min"]
-    ]
-    qc = []
-    for col in numeric_cols:
-        total = len(df)
-        faltantes = int(df[col].isna().sum())
-        qc.append({
-            "Variable": col,
-            "Válidos": total - faltantes,
-            "Faltantes": faltantes,
-            "% Faltantes": round(faltantes / total * 100, 2),
-        })
-    qc_df = pd.DataFrame(qc).sort_values("% Faltantes", ascending=False)
-    st.dataframe(qc_df, use_container_width=True, hide_index=True)
+# Definir ventana exacta de 24 horas: desde las 7:00 AM del día A hasta las 7:00 AM del día A+1
+ts_inicio = datetime.combine(dia_meteo_sel, time(7, 0))
+ts_fin = datetime.combine(dia_meteo_sel + timedelta(days=1), time(7, 0))
 
-# Pestañas de análisis
-tabs = st.tabs([
-    "Temperatura",
-    "Humedad Relativa",
-    "Presión Atmosférica",
-    "Radiación / Luz",
-    "Viento",
-    "Precipitación / QC",
-    "Datos Raw",
-])
+# Filtrar DataFrame para la ventana seleccionada
+df = df_full[(df_full["timestamp"] >= ts_inicio) & (df_full["timestamp"] <= ts_fin)].copy()
 
-# 1. Temperatura
-with tabs[0]:
-    st.pyplot(grafico_temperatura(df), use_container_width=True)
-    if "mcp9808" in df.columns:
-        t_ser = df["mcp9808"].dropna()
-        if not t_ser.empty:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Temperatura Media", f"{t_ser.mean():.1f} °C")
-            c2.metric("Temperatura Mínima", f"{t_ser.min():.1f} °C")
-            c3.metric("Temperatura Máxima", f"{t_ser.max():.1f} °C")
+# -----------------------------------------------------------------------------
+# PROCESAMIENTO QC
+# -----------------------------------------------------------------------------
+if "PC" in df.columns:
+    df["PP_Calculada"] = df["PC"].diff().fillna(0).apply(lambda x: x if 0 < x < 30 else 0.0)
+elif "PP" in df.columns:
+    df["PP_Calculada"] = df["PP"].apply(lambda x: x if 0 < x < 30 else 0.0)
+else:
+    df["PP_Calculada"] = 0.0
 
-# 2. Humedad
-with tabs[1]:
-    if "hum_hum" in df.columns:
-        st.pyplot(
-            grafico_linea(df, ["hum_hum"], ["Humedad Relativa"], "Humedad Relativa (%)", "Humedad (%)"),
-            use_container_width=True,
-        )
-        h_ser = df["hum_hum"].dropna()
-        if not h_ser.empty:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Humedad Media", f"{h_ser.mean():.1f} %")
-            c2.metric("Humedad Mínima", f"{h_ser.min():.1f} %")
-            c3.metric("Humedad Máxima", f"{h_ser.max():.1f} %")
-    else:
-        st.warning("No se encontró el registro de humedad.")
+df["DP"] = df.apply(lambda r: calcular_punto_rocio_magnus(r["AT"], r["RH"]), axis=1)
+df["Es_Lluvia_Real"] = df.apply(lambda r: evaluar_control_calidad_lluvia(r, estacion_id), axis=1)
 
-# 3. Presión
-with tabs[2]:
-    if "bmp_pres" in df.columns:
-        st.pyplot(
-            grafico_linea(df, ["bmp_pres"], ["Presión Atmosférica"], "Presión Atmosférica (hPa)", "Presión (hPa)"),
-            use_container_width=True,
-        )
-    else:
-        st.warning("No se encontró el registro de presión.")
+if aplicar_qc:
+    df["PP_Plot"] = df.apply(lambda r: r["PP_Calculada"] if r["Es_Lluvia_Real"] else 0.0, axis=1)
+    df["PP_Ficticia"] = df.apply(lambda r: r["PP_Calculada"] if not r["Es_Lluvia_Real"] else 0.0, axis=1)
+else:
+    df["PP_Plot"] = df["PP_Calculada"]
+    df["PP_Ficticia"] = 0.0
 
-# 4. Radiación / Luz
-with tabs[3]:
-    cols_luz = [c for c in ["vis_light", "uv_light", "ir_light"] if c in df.columns]
-    etiquetas_luz = ["Luz Visible", "Radiación UV", "Infrarrojo"]
-    if cols_luz:
-        st.pyplot(
-            grafico_linea(df, cols_luz, etiquetas_luz[:len(cols_luz)], "Sensores de Radiación e Irradiancia", "Nivel / Cuentas"),
-            use_container_width=True,
-        )
-    else:
-        st.warning("No se encontraron registros de radiación.")
-
-# 5. Viento
-with tabs[4]:
-    c1, c2 = st.columns([1, 1.2])
-    with c1:
-        fig_viento, info_viento = grafico_viento(df)
-        if fig_viento:
-            st.pyplot(fig_viento, use_container_width=True)
-        else:
-            st.info("No hay datos suficientes de viento.")
-    with c2:
-        if "wind_speed" in df.columns:
-            st.pyplot(
-                grafico_linea(df, ["wind_speed"], ["Velocidad"], "Velocidad del Viento", "Velocidad (m/s)"),
-                use_container_width=True,
-            )
-
-# 6. Precipitación y Control de Calidad (Lluvia Ficticia)
-with tabs[5]:
-    st.markdown("### 🌧️ Precipitación y Control de Calidad (QC)")
-
-    if "tipping" in df.columns:
-        aplicar_qc = st.checkbox("Activar Algoritmo QC (Filtrar Lluvia Ficticia)", value=True)
-
-        factor = st.number_input(
-            "Factor de conversión (mm por vuelco)",
-            min_value=0.001,
-            value=0.2,
-            step=0.001,
-            format="%.3f",
-        )
-
-        df["tipping_diff"] = pd.to_numeric(df["tipping"], errors="coerce").diff().fillna(0)
-        df.loc[df["tipping_diff"] < 0, "tipping_diff"] = 0
-        df["PP_Calculada"] = df["tipping_diff"] * factor
-
-        df["Es_Lluvia_Real"] = df.apply(evaluar_control_calidad_lluvia, axis=1)
-
-        if aplicar_qc:
-            df["PP_Plot"] = df.apply(lambda r: r["PP_Calculada"] if r["Es_Lluvia_Real"] else 0.0, axis=1)
-            df["PP_Ficticia"] = df.apply(lambda r: r["PP_Calculada"] if not r["Es_Lluvia_Real"] else 0.0, axis=1)
-        else:
-            df["PP_Plot"] = df["PP_Calculada"]
-            df["PP_Ficticia"] = 0.0
-
-        total_validado = df["PP_Plot"].sum()
-        total_ficticio = df["PP_Ficticia"].sum()
-
-        m1, m2 = st.columns(2)
-        m1.metric("Precipitación Validada QC", f"{total_validado:.2f} mm")
-        m2.metric("Lluvia Ficticia / Ruido Descartado", f"{total_ficticio:.2f} mm")
-
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            st.pyplot(dibujar_pluviometro(total_validado, 100), use_container_width=True)
-
-        with c2:
-            fig, ax = plt.subplots(figsize=(10, 4.8))
-            ax.bar(df["fecha_hora"], df["PP_Plot"], width=0.005, color="tab:blue", label="Lluvia Validada")
-            if aplicar_qc and total_ficticio > 0:
-                ax.bar(df["fecha_hora"], df["PP_Ficticia"], width=0.005, color="tab:red", label="Lluvia Ficticia (Descartada)")
-
-            ax.set_title("Intensidad de Precipitación (mm)")
-            ax.set_xlabel("Hora")
-            ax.set_ylabel("Precipitación (mm)")
-            ax.legend()
-            dar_formato_eje_hora(ax)
-            fig.autofmt_xdate()
-            fig.tight_layout()
-            st.pyplot(fig, use_container_width=True)
-    else:
-        st.warning("No se encontró el registro 'tipping' para procesar la precipitación.")
-
-# 7. Datos
-with tabs[6]:
-    mostrar = st.multiselect("Variables a mostrar", options=list(df.columns), default=list(df.columns)[:10])
-    st.dataframe(df[mostrar], use_container_width=True, height=450)
-
-# Exportación
-st.subheader("Exportación de datos")
-st.download_button(
-    "⬇️ Descargar CSV limpio",
-    data=convert_df_to_csv(df),
-    file_name="3DPaws_ElSalvador_limpio.csv",
+# Botón de descarga local
+csv_datos = df.to_csv(index=False).encode('utf-8')
+st.sidebar.download_button(
+    label="📥 Descargar CSV del Día Meteo",
+    data=csv_datos,
+    file_name=f"estacion_{estacion_id}_{dia_meteo_sel}_7am_qc.csv",
     mime="text/csv",
 )
+
+st.subheader(f"📊 Día Meteorológico: {ts_inicio.strftime('%d/%m/%Y %I:%M %p')} a {ts_fin.strftime('%d/%m/%Y %I:%M %p')}")
+st.caption(f"Estación: **{estacion_nombre}** | Ventana de 24 horas acumuladas")
+
+# Tarjetas métricas
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Precipitación Validada QC", f"{df['PP_Plot'].sum():.1f} mm")
+col2.metric("Lluvia Ficticia Descartada", f"{df['PP_Ficticia'].sum():.1f} mm")
+col3.metric("Rango Térmico", f"{df['AT'].min():.1f}°C / {df['AT'].max():.1f}°C")
+col4.metric("Humedad Promedio", f"{df['RH'].mean():.0f}%")
+
+# Gráficos Apilados
+fig = make_subplots(
+    rows=4,
+    cols=1,
+    shared_xaxes=True,
+    vertical_spacing=0.03,
+    subplot_titles=(
+        "Precipitación Validada y Ruido de Sensor (mm / 10 min)",
+        "Humedad Relativa (%)",
+        "Presión Barométrica (hPa)",
+        "Temperatura del Aire (°C) y Punto de Rocío (°C)",
+    ),
+)
+
+fig.add_trace(go.Bar(x=df["timestamp"], y=df["PP_Plot"], marker_color="#38BDF8", name="Lluvia Real"), row=1, col=1)
+if aplicar_qc:
+    fig.add_trace(go.Bar(x=df["timestamp"], y=df["PP_Ficticia"], marker_color="#EF4444", name="Lluvia Ficticia"), row=1, col=1)
+
+fig.add_trace(go.Scatter(x=df["timestamp"], y=df["RH"], mode="lines", line=dict(color="#C084FC", width=2), name="Humedad"), row=2, col=1)
+fig.add_trace(go.Scatter(x=df["timestamp"], y=df["BP"], mode="lines", line=dict(color="#F87171", width=2), name="Presión"), row=3, col=1)
+fig.add_trace(go.Scatter(x=df["timestamp"], y=df["AT"], mode="lines", line=dict(color="#FB923C", width=2), name="Temp"), row=4, col=1)
+fig.add_trace(go.Scatter(x=df["timestamp"], y=df["DP"], mode="lines", line=dict(color="#38BDF8", width=1.5, dash="dash"), name="P. Rocío"), row=4, col=1)
+
+fig.update_layout(template="plotly_dark", height=850, margin=dict(l=20, r=20, t=40, b=20))
+st.plotly_chart(fig, use_container_width=True)
